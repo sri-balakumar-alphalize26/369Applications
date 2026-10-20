@@ -1,9 +1,11 @@
 from odoo import models, fields, api, exceptions
 from datetime import date, timedelta
+from markupsafe import Markup, escape
 import calendar
 import io
 import base64
 import logging
+import math
 
 _logger = logging.getLogger(__name__)
 
@@ -272,10 +274,12 @@ class EmployeeReport(models.Model):
             # day. Example: June with Friday off + positions "2,4,5" →
             # 26 full days + 0.5 + 0.5 = 27.
             total_working_days = 0.0
+            half_fri_count = 0  # for the Calculation popup only
             current_date = d_from
             while current_date <= d_to:
                 if Config.is_half_day_friday(current_date, emp.id):
                     total_working_days += 0.5
+                    half_fri_count += 1
                 elif current_date.weekday() in working_days_list:
                     if not Holiday.is_public_holiday(current_date, emp.company_id.id):
                         total_working_days += 1
@@ -323,6 +327,7 @@ class EmployeeReport(models.Model):
             total_late_deduction = 0.0
             late_dates_seen = set()
             late_date_info = {}  # date -> list of attendance records
+            late_items = []  # for the Calculation popup only
 
             for att in late_records:
                 all_late_times += 1
@@ -338,10 +343,16 @@ class EmployeeReport(models.Model):
                 # matches the day-wise breakdown (and a single Refresh suffices —
                 # no separate "Recompute Late Records" step needed).
                 if att.is_waived:
+                    late_items.append({'date': att.date, 'minutes': att.late_minutes,
+                                       'status': 'waived', 'amount': 0.0})
                     continue
                 if att.late_sequence and att.late_sequence <= grace_days:
+                    late_items.append({'date': att.date, 'minutes': att.late_minutes,
+                                       'status': 'grace', 'amount': 0.0})
                     continue
                 live_ded = calc_deduction_live(att.late_minutes, att.date)
+                late_items.append({'date': att.date, 'minutes': att.late_minutes,
+                                   'status': 'cut', 'amount': live_ded})
                 if live_ded > 0:
                     late_times_after_grace += 1
                     total_late_deduction += live_ded
@@ -372,12 +383,22 @@ class EmployeeReport(models.Model):
                 self.env['hr.leave.request']._fields['leave_type'].selection
             )
 
+            leave_items = []  # for the Calculation popup only
+
             for lr in leave_records:
                 total_paid_days += lr.paid_days
                 total_unpaid_days += lr.unpaid_days
                 _lr_ded = calc_leave_deduction_live(lr)
                 total_leave_deduction += _lr_ded
                 total_leave_only_ded += _lr_ded  # leave-request deductions only
+                leave_items.append({
+                    'label': type_labels.get(lr.leave_type, lr.leave_type) or 'Leave',
+                    'from': lr.from_date,
+                    'to': lr.to_date or lr.from_date,
+                    'paid': lr.paid_days,
+                    'unpaid': lr.unpaid_days,
+                    'amount': _lr_ded,
+                })
 
                 # Map leave to each day it covers
                 lr_start = lr.from_date
@@ -387,6 +408,19 @@ class EmployeeReport(models.Model):
                     if d_from <= lr_current <= d_to:
                         leave_date_info[lr_current] = lr
                     lr_current += timedelta(days=1)
+
+            # Leave days worth a warning in the Calculation popup: leave on a day
+            # the employee also came, or on a day off (leave requests count
+            # calendar days, so a day off inside a leave is still counted).
+            leave_on_work_dates = sorted(dd for dd in leave_date_info if dd in present_dates)
+            leave_on_off_dates = sorted(
+                dd for dd in leave_date_info
+                if dd not in present_dates and (
+                    Holiday.is_public_holiday(dd, emp.company_id.id)
+                    or (dd.weekday() not in working_days_list
+                        and not Config.is_half_day_friday(dd, emp.id))
+                )
+            )
 
             # ── AUTO HALF-DAY DETECTION (split shift only) ───
             # For each working day, check if only one session has attendance
@@ -484,6 +518,10 @@ class EmployeeReport(models.Model):
 
             current_date = d_from
             day_seq = 0
+            # Working days with no attendance and no leave, for the Calculation
+            # popup: already passed vs still to come this month.
+            absent_past_days = 0.0
+            absent_future_days = 0.0
             while current_date <= d_to:
                 is_working = current_date.weekday() in working_days_list
                 is_holiday = Holiday.is_public_holiday(current_date, emp.company_id.id)
@@ -657,8 +695,10 @@ class EmployeeReport(models.Model):
                     # Expected working day with no attendance and no leave.
                     # Future days haven't arrived yet → don't show them at all.
                     if current_date > report_today:
+                        absent_future_days += 0.5 if is_half_day_fri else 1
                         current_date += timedelta(days=1)
                         continue
+                    absent_past_days += 0.5 if is_half_day_fri else 1
                     # Past/today working day with nothing entered → "Not Entered"
                     # (data-entry pending). In the earnings model it simply isn't
                     # earned, so it's already reflected in Final / Total Deduction;
@@ -717,6 +757,55 @@ class EmployeeReport(models.Model):
             leave_ded = round(total_leave_only_ded, 2)
             total_ded = round(max(0.0, emp_wage - final_amt - leave_ded), 2)
 
+            # Hourly late-cut rate, same formula as get_hourly_deduction(), so the
+            # Calculation popup can show "7 hours × 1.139".
+            hourly_info = None
+            if deduction_mode == 'hourly' and config_rec and config_rec.daily_work_hours > 0:
+                ded_wage = 0.0
+                for fname in ('contract_wage', 'wage'):
+                    try:
+                        v = getattr(emp, fname, 0.0) or 0.0
+                    except Exception:
+                        v = 0.0
+                    if v > 0:
+                        ded_wage = v
+                        break
+                month_wd = config_rec.get_working_days_in_month(
+                    d_from.year, d_from.month, emp.company_id.id)
+                if ded_wage > 0 and month_wd > 0:
+                    hourly_info = {
+                        'wage': ded_wage,
+                        'working_days': month_wd,
+                        'hours': config_rec.daily_work_hours,
+                        'rate': ded_wage / month_wd / config_rec.daily_work_hours,
+                    }
+
+            calculation_html = self._build_calculation_html({
+                'currency': self.currency_id,
+                'wage': emp_wage,
+                'working_days': total_working_days,
+                'half_fri_count': half_fri_count,
+                'daily_rate': daily_rate,
+                'present_days': total_present_days,
+                'auto_half': sorted(auto_half_day_info.items()),
+                'leaves': leave_items,
+                'leave_on_work_dates': leave_on_work_dates,
+                'leave_on_off_dates': leave_on_off_dates,
+                'paid_leave_days': total_paid_days,
+                'absent_past': absent_past_days,
+                'absent_future': absent_future_days,
+                'earned_days': earned_days,
+                'earned_uncapped': round(daily_rate * earned_days, 2),
+                'earned': earned,
+                'late_items': late_items,
+                'grace_days': grace_days,
+                'hourly': hourly_info,
+                'late_total': round(total_late_deduction, 2),
+                'final': final_amt,
+                'leave_ded': leave_ded,
+                'total_ded': total_ded,
+            })
+
             summary_vals.append({
                 'report_id': self.id,
                 'employee_id': emp.id,
@@ -736,6 +825,7 @@ class EmployeeReport(models.Model):
                 'wage': emp_wage,
                 'total_deduction': total_ded,
                 'final_amount': final_amt,
+                'calculation_html': calculation_html,
             })
 
         # Batch create
@@ -743,6 +833,183 @@ class EmployeeReport(models.Model):
             self.env['hr.employee.report.summary.line'].create(summary_vals)
         if detail_vals:
             self.env['hr.employee.report.detail.line'].create(detail_vals)
+
+    # ── Calculation popup ────────────────────────────────────
+    def _build_calculation_html(self, d):
+        """Explain one employee's Final / Leave Deduction / Total Deduction in
+        plain words for the 🧮 Calculation popup.
+
+        Built from the exact figures _generate_data just used, so the popup
+        always matches the row it belongs to.
+        """
+        cur = d['currency']
+        dp = cur.decimal_places if cur else 2
+
+        def amt(v):
+            return f"{v:,.{dp}f}"
+
+        def num(v):
+            return f"{round(v, 2):g}"
+
+        def days(v):
+            return f"{num(v)} day" if round(v, 2) == 1 else f"{num(v)} days"
+
+        def day_str(dd):
+            return f"{dd.day} {dd.strftime('%b')}"
+
+        def range_str(a, b):
+            if not b or a == b:
+                return day_str(a)
+            if a.month == b.month:
+                return f"{a.day}–{b.day} {b.strftime('%b')}"
+            return f"{day_str(a)} – {day_str(b)}"
+
+        def late_str(minutes):
+            h, m = divmod(int(minutes or 0), 60)
+            parts = []
+            if h:
+                parts.append(f"{h} hr" if h == 1 else f"{h} hrs")
+            if m or not h:
+                parts.append(f"{m} min")
+            return ' '.join(parts)
+
+        def bold(text):
+            return Markup('<b>{}</b>').format(text)
+
+        def sub(text):
+            return Markup('<span class="ps-3 text-muted">• {}</span>').format(text)
+
+        def block(title, lines):
+            body = Markup('').join(Markup('<div>{}</div>').format(ln) for ln in lines)
+            return Markup('<div class="mb-3"><div class="fw-bold fs-6 mb-1">{}</div>'
+                          '<div class="ps-3">{}</div></div>').format(title, body)
+
+        wage = d['wage']
+        rate = d['daily_rate']
+
+        if wage <= 0 or d['working_days'] <= 0:
+            return Markup('<p>No monthly salary is set for this employee, '
+                          'so everything is 0.</p>')
+
+        out = []
+
+        # One day's salary
+        out.append(block("One day's salary", [
+            f"Monthly salary = {amt(wage)}",
+            f"Working days = {num(d['working_days'])}",
+            bold(f"One day's salary = {amt(wage)} ÷ {num(d['working_days'])} = {amt(rate)}"),
+        ]))
+
+        # Days paid
+        lines = [f"Came to work = {days(d['present_days'])}"
+                 + (" → paid" if d['present_days'] else "")]
+        for hd_date, info in d['auto_half']:
+            which = 'evening' if info.get('session') == 'am' else 'morning'
+            lines.append(sub(f"{day_str(hd_date)} – came only in the {which} → half day paid"))
+
+        unpaid_leave_days = 0.0
+        for lv in d['leaves']:
+            total_lv = lv['paid'] + lv['unpaid']
+            if lv['unpaid'] <= 0:
+                split = 'paid'
+            elif lv['paid'] <= 0:
+                split = 'not paid'
+            else:
+                split = f"{days(lv['paid'])} paid, {days(lv['unpaid'])} not paid"
+            label = lv['label'] if 'leave' in lv['label'].lower() else f"{lv['label']} leave"
+            lines.append(f"{label} {range_str(lv['from'], lv['to'])} = "
+                         f"{days(total_lv)} → {split}")
+            unpaid_leave_days += lv['unpaid']
+
+        absent = d['absent_past'] + d['absent_future']
+        if absent:
+            lines.append(f"Did not come = {days(absent)} → not paid")
+            fut = d['absent_future']
+            if fut:
+                lines.append(sub(f"{num(fut)} of these days "
+                                 f"{'is' if round(fut, 2) == 1 else 'are'} still to come"))
+
+        lines.append(bold(f"Days paid = {days(d['earned_days'])}"))
+        lines.append(bold(f"Salary for days paid = {num(d['earned_days'])} × {amt(rate)} = "
+                          f"{amt(d['earned_uncapped'])}"))
+        if d['earned'] < d['earned_uncapped']:
+            lines.append(f"This is more than the monthly salary, so it is {amt(d['earned'])}.")
+        out.append(block("Days paid", lines))
+
+        # Late
+        late_items = d['late_items']
+        hourly = d['hourly']
+        if late_items:
+            cuts = [li for li in late_items if li['status'] == 'cut' and li['amount'] > 0]
+            one_hourly_cut = bool(hourly) and len(cuts) == 1
+            lines = []
+            if hourly and cuts:
+                lines.append(f"One hour's salary = {hourly['rate']:.3f}")
+            for li in late_items:
+                head = f"{day_str(li['date'])} – late {late_str(li['minutes'])}"
+                if li['status'] == 'grace':
+                    lines.append(f"{head} → no cut (first {d['grace_days']} lates are free)")
+                elif li['status'] == 'waived':
+                    lines.append(f"{head} → no cut (excused)")
+                elif li['amount'] <= 0:
+                    lines.append(f"{head} → no cut")
+                elif hourly:
+                    hrs = math.ceil(li['minutes'] / 60.0)
+                    counted = f"{head} → counted as {hrs} {'hour' if hrs == 1 else 'hours'}"
+                    lines.append(counted if one_hourly_cut
+                                 else f"{counted} → cut {amt(li['amount'])}")
+                else:
+                    lines.append(f"{head} → cut {amt(li['amount'])}")
+            if one_hourly_cut:
+                hrs = math.ceil(cuts[0]['minutes'] / 60.0)
+                lines.append(bold(f"Late cut = {hrs} × {hourly['rate']:.3f} = "
+                                  f"{amt(d['late_total'])}"))
+            else:
+                total_word = 'Late cut total' if len(cuts) > 1 else 'Late cut'
+                lines.append(bold(f"{total_word} = {amt(d['late_total'])}"))
+            out.append(block("Late", lines))
+
+        # Final salary
+        if d['late_total'] > 0:
+            final_text = (f"FINAL SALARY = {amt(d['earned'])} − {amt(d['late_total'])} "
+                          f"= {amt(d['final'])}")
+        else:
+            final_text = f"FINAL SALARY = {amt(d['final'])}"
+        out.append(Markup('<div class="alert alert-success fs-5 fw-bold mb-3">{}</div>')
+                   .format(final_text))
+        if d['earned'] - d['late_total'] < 0:
+            out.append(Markup('<div class="text-muted mb-3">{}</div>').format(
+                "The late cut is more than the salary for days paid, so the final salary is 0."))
+
+        # Good to know
+        late_applied = round(d['earned'] - d['final'], 2)
+        not_paid_amt = max(0.0, round(d['total_ded'] - late_applied, 2))
+        notes = []
+        if d['leave_ded']:
+            unit = 'day' if round(unpaid_leave_days, 2) == 1 else 'days'
+            notes.append(f"Leave Deduction ({amt(d['leave_ded'])}) = "
+                         f"{num(unpaid_leave_days)} unpaid {unit} × {amt(rate)}. "
+                         f"It is NOT cut again from the final salary.")
+        td = f"Total Deduction ({amt(d['total_ded'])}) = salary for days not paid ({amt(not_paid_amt)})"
+        if late_applied:
+            td += f" + late cut ({amt(late_applied)})"
+        notes.append(td + ". It is NOT an extra cut.")
+        for dd in d['leave_on_work_dates']:
+            notes.append(f"⚠ {day_str(dd)} – came to work and also has leave on the same "
+                         f"day. Please check.")
+        for dd in d['leave_on_off_dates']:
+            notes.append(f"⚠ {day_str(dd)} ({dd.strftime('%A')}) – this is a day off, but "
+                         f"the leave on it is still counted. Please check.")
+        check_sum = d['final'] + d['leave_ded'] + d['total_ded']
+        notes.append(f"Check: {amt(d['final'])} + {amt(d['leave_ded'])} + "
+                     f"{amt(d['total_ded'])} = {amt(check_sum)}"
+                     + (" ✓" if abs(check_sum - wage) < 0.005 else ""))
+
+        out.append(Markup('<div class="alert alert-info mb-0"><b>Good to know</b>'
+                          '<ul class="mb-0 mt-1">{}</ul></div>').format(
+            Markup('').join(Markup('<li>{}</li>').format(n) for n in notes)))
+
+        return Markup('<div class="o_emp_calc">{}</div>').format(Markup('').join(out))
 
     # ── PDF Export ────────────────────────────────────────────
     def action_print_pdf(self):
@@ -982,7 +1249,29 @@ class EmployeeReportSummaryLine(models.Model):
     total_deduction = fields.Float(string='Total Deduction', readonly=True)
     final_amount = fields.Float(string='Final Amount', readonly=True)
 
+    # Plain-words breakdown of the figures above, built by _generate_data
+    calculation_html = fields.Html(string='Calculation', readonly=True, sanitize=False)
+
     # ── Drill-down Actions ───────────────────────────────────
+    def action_view_calculation(self):
+        """Open the plain-words salary breakdown for this employee in a popup."""
+        self.ensure_one()
+        if not self.calculation_html:
+            raise exceptions.UserError(
+                "This report was made before the Calculation button was added. "
+                "Click ⟳ Refresh on the report to build the calculation."
+            )
+        view_id = self.env.ref('hr_employee_report.view_summary_line_calculation_form').id
+        return {
+            'name': f'Calculation – {self.employee_name}',
+            'type': 'ir.actions.act_window',
+            'res_model': 'hr.employee.report.summary.line',
+            'res_id': self.id,
+            'view_mode': 'form',
+            'views': [(view_id, 'form')],
+            'target': 'new',
+        }
+
     def action_view_day_details(self):
         """Open day-wise detail lines for this employee from the report."""
         self.ensure_one()

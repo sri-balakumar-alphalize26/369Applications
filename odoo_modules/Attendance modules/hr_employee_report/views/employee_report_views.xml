@@ -146,6 +146,9 @@
                                     <button name="action_view_leave_records" type="object"
                                             string="🗓 Leave" title="View Leave Records"
                                             class="btn-link"/>
+                                    <button name="action_view_calculation" type="object"
+                                            string="🧮 Calculation" title="How this employee's salary is calculated"
+                                            class="btn-link"/>
                                 </list>
                             </field>
                         </page>
@@ -205,6 +208,8 @@
                     <button name="action_view_leave_records" type="object"
                             string="View Leave Records" class="btn-primary"
                             invisible="paid_leave_days == 0 and unpaid_leave_days == 0"/>
+                    <button name="action_view_calculation" type="object"
+                            string="🧮 Calculation" class="btn-primary"/>
                 </header>
                 <sheet>
                     <field name="currency_id" invisible="1"/>
@@ -238,6 +243,28 @@
                         </group>
                     </group>
                 </sheet>
+            </form>
+        </field>
+    </record>
+
+    <!-- ═══════════════════════════════════════════════════════
+         SUMMARY LINE – Calculation popup (🧮 button)
+         ═══════════════════════════════════════════════════════ -->
+    <record id="view_summary_line_calculation_form" model="ir.ui.view">
+        <field name="name">hr.employee.report.summary.line.calculation.form</field>
+        <field name="model">hr.employee.report.summary.line</field>
+        <field name="priority">20</field>
+        <field name="arch" type="xml">
+            <form string="Calculation" create="0" edit="0">
+                <sheet>
+                    <div class="oe_title">
+                        <h2><field name="employee_name" readonly="1"/></h2>
+                    </div>
+                    <field name="calculation_html" nolabel="1" readonly="1"/>
+                </sheet>
+                <footer>
+                    <button string="Close" class="btn-secondary" special="cancel"/>
+                </footer>
             </form>
         </field>
     </record>

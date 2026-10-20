@@ -1,6 +1,6 @@
 {
     "name": "Employee Monthly Report (Dynamic)",
-    "version": "19.0.3.0.0",
+    "version": "19.0.3.1.0",
     "author": "369ai",
     "category": "Human Resources",
     "summary": "Dynamic employee monthly report with day-wise attendance, late tracking, leave, deductions, H:MM format, PDF & Excel export",
