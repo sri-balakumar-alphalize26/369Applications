@@ -3,7 +3,7 @@
     "name": "369aiAlphalize",
     "slug": "369aialphalize",
     "owner": "wikike",
-    "version": "1.0.90",
+    "version": "1.0.91",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -28,7 +28,7 @@
       }
     },
     "android": {
-      "versionCode": 3,
+      "versionCode": 4,
       "splash": {
         "image": "./assets/splash.png",
         "resizeMode": "contain",
