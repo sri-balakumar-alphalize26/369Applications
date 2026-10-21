@@ -14,6 +14,11 @@ import offlineQueue from '@utils/offlineQueue';
 import { Asset } from 'expo-asset';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { hydrateOfficeTimezone } from '@utils/officeTime';
+import { installOdooSessionGuard } from '@utils/odooSession';
+
+// Re-login + retry when the stored Odoo session has expired (Odoo answers
+// call_kw with a bare 404 on multi-database servers). Covers every axios call.
+installOdooSessionGuard();
 
 // One-time migration of legacy un-namespaced sale-order maps into the
 // per-DB A-map for the currently-active Odoo DB. Runs once per DB.

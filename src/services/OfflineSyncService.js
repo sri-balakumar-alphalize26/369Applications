@@ -12,6 +12,7 @@ import axios from 'axios';
 import { AppState } from 'react-native';
 import offlineQueue from '@utils/offlineQueue';
 import networkStatus from '@utils/networkStatus';
+import { reauthenticateOdoo } from '@utils/odooSession';
 import { getOdooBaseUrl } from '@api/config/odooConfig';
 
 let started = false;
@@ -79,39 +80,14 @@ const _looksLikeSessionExpired = (errData) => {
     );
 };
 
-// Force-refresh the Odoo session cookie via /web/session/authenticate using
-// the credentials the user most recently logged in with. Returns updated
-// headers including the new Cookie, or null if the attempt fails.
+// Force-refresh the Odoo session cookie using the credentials the user most
+// recently logged in with (shared helper in @utils/odooSession). Returns
+// updated headers including the new Cookie, or null if the attempt fails.
 const _reauthenticateForSync = async () => {
-    try {
-        const { getOdooBaseUrl } = require('@api/config/odooConfig');
-        const baseUrl = (getOdooBaseUrl() || '').replace(/\/+$/, '');
-        if (!baseUrl) return null;
-        const db = await AsyncStorage.getItem('odoo_db');
-        const savedRaw = await AsyncStorage.getItem('saved_credentials');
-        if (!db || !savedRaw) return null;
-        let map = null;
-        try { map = JSON.parse(savedRaw); } catch (_) { return null; }
-        if (!map || typeof map !== 'object') return null;
-        // Pick the entry matching the current URL+DB combo.
-        const wantKey = `${baseUrl.toLowerCase().replace(/\/+$/, '')}|${db}`;
-        const entry = map[wantKey];
-        if (!entry || !entry.username || !entry.password) return null;
-        const resp = await axios.post(
-            `${baseUrl}/web/session/authenticate`,
-            { jsonrpc: '2.0', method: 'call', params: { db, login: entry.username, password: entry.password } },
-            { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
-        );
-        if (!resp.data?.result?.uid) return null;
-        const setCookie = resp.headers['set-cookie'] || resp.headers['Set-Cookie'];
-        const cookieStr = Array.isArray(setCookie) ? setCookie.join('; ') : String(setCookie || '');
-        if (cookieStr) await AsyncStorage.setItem('odoo_cookie', cookieStr);
-        console.log('[OfflineSyncService] re-authenticated session for sync');
-        return { 'Content-Type': 'application/json', Cookie: cookieStr };
-    } catch (e) {
-        console.warn('[OfflineSyncService] re-auth failed:', e?.message);
-        return null;
-    }
+    const cookieStr = await reauthenticateOdoo();
+    if (cookieStr === null) return null;
+    console.log('[OfflineSyncService] re-authenticated session for sync');
+    return { 'Content-Type': 'application/json', Cookie: cookieStr };
 };
 
 // Persistent map of offline placeholder ids ("offline_<queueItemId>") to real
