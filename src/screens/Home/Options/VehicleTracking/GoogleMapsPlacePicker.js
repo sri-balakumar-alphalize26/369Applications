@@ -20,8 +20,14 @@ import { getAddressFromCoords } from '@utils/addressFromCoords';
 
 // Google Maps changes the address without reloading the page, so report it
 // from inside the page whenever it changes.
+//
+// The WebView re-runs injectedJavaScript every time Google's page reports a
+// load (many times per visit), so each script below installs itself only once
+// per page; otherwise its timers and listeners pile up.
 const WATCH_URL_JS = `
   (function () {
+    if (window.__rnPickerWatch) return;
+    window.__rnPickerWatch = true;
     var last = '';
     function check() {
       if (location.href !== last) {
@@ -41,6 +47,8 @@ const WATCH_URL_JS = `
 // map and place pages keep working.
 const TIDY_PAGE_JS = `
   (function () {
+    if (window.__rnPickerTidy) return;
+    window.__rnPickerTidy = true;
     // "Google Maps | Open app" bar at the top, and the 45px gap Google leaves
     // for it above the map.
     var style = document.createElement('style');
@@ -92,6 +100,88 @@ const TIDY_PAGE_JS = `
     }
     tidy();
     setInterval(tidy, 500);
+  })();
+  true;
+`;
+
+// Inside the app Google can serve its lighter map made of image tiles (seen
+// on the tablet). There a quick tap on a place does nothing — only a
+// long-press drops a pin. So a quick single tap on the map is replayed as a
+// long-press at the same spot, which makes Google pin and open that place.
+// Double-tap zoom, pinch and drags are left alone, and so is a tap Google
+// already handled itself (the address turned into a place).
+const TAP_TO_PIN_JS = `
+  (function () {
+    if (window.__rnPickerTapToPin) return;
+    window.__rnPickerTapToPin = true;
+    var start = null, pending = null;
+
+    // The tapped element when it sits on the tile map (the #app block that
+    // holds the image tiles), not on a button or a panel over it.
+    function mapElementAt(x, y) {
+      var el = document.elementFromPoint(x, y);
+      if (!el || el.closest('button, a, input, textarea, [role="button"], [role="link"]')) return null;
+      var app = document.getElementById('app');
+      var block = el;
+      while (block && block.parentElement !== app) block = block.parentElement;
+      return block && block.querySelector('img[src^="blob:"]') ? el : null;
+    }
+
+    function longPress(el, x, y) {
+      var id = 4242;
+      function pointer(type) {
+        return new PointerEvent(type, {
+          bubbles: true, cancelable: true, composed: true, pointerId: id, pointerType: 'touch',
+          isPrimary: true, clientX: x, clientY: y, screenX: x, screenY: y,
+          button: 0, buttons: type === 'pointerup' ? 0 : 1,
+        });
+      }
+      function touch(type) {
+        var t = new Touch({ identifier: id, target: el, clientX: x, clientY: y, screenX: x, screenY: y, pageX: x, pageY: y });
+        var list = type === 'touchend' ? [] : [t];
+        return new TouchEvent(type, {
+          bubbles: true, cancelable: true, composed: true, touches: list, targetTouches: list, changedTouches: [t],
+        });
+      }
+      el.dispatchEvent(pointer('pointerdown'));
+      el.dispatchEvent(touch('touchstart'));
+      setTimeout(function () {
+        el.dispatchEvent(pointer('pointerup'));
+        el.dispatchEvent(touch('touchend'));
+      }, 700);
+    }
+
+    // On window (capture), which runs before the map's own handlers can stop
+    // the event from reaching document.
+    // Only real input (isTrusted) — never our own replayed press. pointerType
+    // isn't checked: some devices report '' instead of 'touch' for a finger.
+    window.addEventListener('pointerdown', function (e) {
+      if (!e.isTrusted) return;
+      // A second finger or a second tap (double-tap zoom) cancels the pin,
+      // and that second tap doesn't start one of its own.
+      var secondTap = !!pending;
+      if (pending) { clearTimeout(pending); pending = null; }
+      start = e.isPrimary && !secondTap ? { x: e.clientX, y: e.clientY, t: Date.now(), href: location.href } : null;
+    }, true);
+
+    window.addEventListener('pointercancel', function (e) {
+      if (e.isTrusted) start = null;
+    }, true);
+
+    window.addEventListener('pointerup', function (e) {
+      if (!e.isTrusted || !start) return;
+      var s = start;
+      start = null;
+      var moved = Math.abs(e.clientX - s.x) + Math.abs(e.clientY - s.y);
+      if (moved > 12 || Date.now() - s.t > 400) return;
+      var el = mapElementAt(s.x, s.y);
+      if (!el) return;
+      pending = setTimeout(function () {
+        pending = null;
+        if (location.href !== s.href && /\\/maps\\/place\\//.test(location.href)) return;
+        longPress(el, s.x, s.y);
+      }, 350);
+    }, true);
   })();
   true;
 `;
@@ -184,7 +274,7 @@ const GoogleMapsPlacePicker = ({ route }) => {
             incognito
             userAgent={MOBILE_CHROME_UA}
             onLoadStart={() => console.log('[gmaps-picker] open:', startUrlRef.current)}
-            injectedJavaScript={WATCH_URL_JS + TIDY_PAGE_JS}
+            injectedJavaScript={WATCH_URL_JS + TIDY_PAGE_JS + TAP_TO_PIN_JS}
             onMessage={(e) => handleUrl(e.nativeEvent.data)}
             onNavigationStateChange={(nav) => handleUrl(nav?.url)}
             onShouldStartLoadWithRequest={handleShouldStart}
