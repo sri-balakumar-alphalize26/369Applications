@@ -26,9 +26,7 @@ import { formatDate, formatDateTime } from '@utils/common/date';
 import { showToastMessage } from '@components/Toast';
 import { fetchVehiclesOdoo, fetchVehiclesVehicleTracking } from '@api/services/generalApi';
 import { fetchVehicleDetails, fetchLocations } from '@api/details/detailApi';
-import { post } from '@api/services/utils';
 import { createVehicleTrackingTripOdoo } from '@api/services/generalApi';
-import { VEHICLE_TRACKING_URL } from '@api/endpoints/endpoints';
 import { OverlayLoader } from '@components/Loader';
 import { cancelVehicleTrackingTripOdoo, fetchInvoiceByIdOdoo, fetchInvoiceByQrOdoo, createFuelLogOdoo } from '@api/services/generalApi';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
@@ -2166,41 +2164,26 @@ const VehicleTrackingForm = ({ navigation, route }) => {
       } catch (odooErr) {
         console.error('[handleSubmit] RPC FAILED — staying on form:', odooErr?.message);
         console.error('Odoo trip creation failed:', odooErr);
-        // Inspect error and if it mentions vehicle.tracking or unknown comodels, fallback to REST backend
-        const errPayload = odooErr && (odooErr.data || odooErr.response || odooErr);
-        const errString = JSON.stringify(errPayload || odooErr || '');
-        const shouldFallback = errString.includes('vehicle.tracking') || errString.includes('unknown comodel_name') || errString.includes('Invalid field');
-        if (shouldFallback) {
-          showToastMessage('Odoo model unavailable — falling back to REST API', 'warning');
-          try {
-            const restResp = await post(VEHICLE_TRACKING_URL, submitData);
-            console.log('Fallback REST response:', restResp);
-            response = restResp;
-          } catch (restErr) {
-            console.error('Fallback REST failed:', restErr);
-            showToastMessage('Failed to create trip via REST fallback', 'error');
-            setIsSubmitting(false);
-            return;
-          }
-        } else {
-          const odooMsg = odooErr?.message && odooErr.message !== 'Odoo JSON-RPC error'
-            ? odooErr.message
-            : 'Failed to create trip in Odoo';
-          console.error('[VehicleTrackingForm] Odoo trip creation rejected. Final user message:', odooMsg);
-          console.error('[VehicleTrackingForm] Raw Odoo error:', odooErr);
-          console.error('[VehicleTrackingForm] Odoo error name/code:', odooErr?.name, odooErr?.code);
-          console.error('[VehicleTrackingForm] Odoo error.data:', odooErr?.data);
-          console.error('[VehicleTrackingForm] Odoo error.response:', odooErr?.response);
-          console.error('[VehicleTrackingForm] Odoo error stack:', odooErr?.stack);
-          try {
-            console.error('[VehicleTrackingForm] Submit payload that was rejected:', JSON.stringify(submitData));
-          } catch (e) {
-            console.error('[VehicleTrackingForm] Submit payload (could not stringify):', submitData);
-          }
-          showToastMessage(odooMsg, 'error');
-          setIsSubmitting(false);
-          return;
+        // No REST fallback: it posted to an undefined URL and failed every time,
+        // and any HTTP error (e.g. an expired session's 404) was misread as
+        // "model unavailable". Show the real reason and stay on the form.
+        const odooMsg = odooErr?.message && odooErr.message !== 'Odoo JSON-RPC error'
+          ? odooErr.message
+          : 'Failed to create trip in Odoo';
+        console.error('[VehicleTrackingForm] Odoo trip creation rejected. Final user message:', odooMsg);
+        console.error('[VehicleTrackingForm] Raw Odoo error:', odooErr);
+        console.error('[VehicleTrackingForm] Odoo error name/code:', odooErr?.name, odooErr?.code);
+        console.error('[VehicleTrackingForm] Odoo error.data:', odooErr?.data);
+        console.error('[VehicleTrackingForm] Odoo error.response:', odooErr?.response);
+        console.error('[VehicleTrackingForm] Odoo error stack:', odooErr?.stack);
+        try {
+          console.error('[VehicleTrackingForm] Submit payload that was rejected:', JSON.stringify(submitData));
+        } catch (e) {
+          console.error('[VehicleTrackingForm] Submit payload (could not stringify):', submitData);
         }
+        showToastMessage(odooMsg, 'error');
+        setIsSubmitting(false);
+        return;
       }
 
       // Update form state if trip was started
